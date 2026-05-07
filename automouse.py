@@ -10,9 +10,11 @@ import pystray
 from PIL import Image, ImageDraw
 
 APP_NAME = "MouseMover"
-IDLE_THRESHOLD_SEC = 9 * 60
+IDLE_THRESHOLD_SEC = 4 * 60
 NUDGE_PIXELS = 5
 CHECK_INTERVAL_SEC = 15
+
+MOUSEEVENTF_MOVE = 0x0001
 
 
 def _base_dir() -> str:
@@ -58,21 +60,13 @@ def get_idle_seconds() -> float:
     return (kernel32.GetTickCount() - lii.dwTime) / 1000.0
 
 
-def get_cursor_pos() -> tuple[int, int]:
-    pt = POINT()
-    user32.GetCursorPos(ctypes.byref(pt))
-    return pt.x, pt.y
-
-
-def set_cursor_pos(x: int, y: int) -> None:
-    user32.SetCursorPos(int(x), int(y))
-
-
 def nudge_mouse() -> None:
-    x, y = get_cursor_pos()
-    set_cursor_pos(x + NUDGE_PIXELS, y)
+    # SetCursorPos 는 커서 좌표만 텔레포트하고 입력 이벤트를 큐에 넣지 않아
+    # GetLastInputInfo / 화면보호기 타이머가 리셋되지 않음.
+    # mouse_event 는 실제 입력 이벤트를 주입하므로 OS 가 "사용자 입력" 으로 인식.
+    user32.mouse_event(MOUSEEVENTF_MOVE, NUDGE_PIXELS, 0, 0, 0)
     time.sleep(0.05)
-    set_cursor_pos(x, y)
+    user32.mouse_event(MOUSEEVENTF_MOVE, -NUDGE_PIXELS, 0, 0, 0)
 
 
 class State:
@@ -83,19 +77,28 @@ class State:
         self.started_at = datetime.now()
 
 
-def worker(state: State) -> None:
+def worker(state: State, icon) -> None:
     log(
-        f"{APP_NAME} 워커 시작 - 임계값 {IDLE_THRESHOLD_SEC // 60}분, "
-        f"이동 {NUDGE_PIXELS}px, 점검 {CHECK_INTERVAL_SEC}s"
+        f"{APP_NAME} worker started - threshold {IDLE_THRESHOLD_SEC // 60}min, "
+        f"nudge {NUDGE_PIXELS}px, interval {CHECK_INTERVAL_SEC}s"
     )
     while not state.stop.is_set():
         try:
             idle = get_idle_seconds()
             if idle >= IDLE_THRESHOLD_SEC:
                 nudge_mouse()
+                # 입력 주입이 정상이면 0초 근처가 찍힘 (검증용)
+                post_idle = get_idle_seconds()
                 state.nudge_count += 1
                 state.last_nudge = datetime.now()
-                log(f"유휴 {int(idle)}초 감지 - 마우스 이동 (누적 {state.nudge_count}회)")
+                log(
+                    f"idle={int(idle)}s -> nudge "
+                    f"(count={state.nudge_count}, post_idle={post_idle:.2f}s)"
+                )
+                try:
+                    icon.update_menu()
+                except Exception as e:
+                    log(f"update_menu failed: {e!r}")
                 if state.stop.wait(CHECK_INTERVAL_SEC):
                     break
             else:
@@ -103,10 +106,10 @@ def worker(state: State) -> None:
                 if state.stop.wait(min(CHECK_INTERVAL_SEC, max(1.0, remaining))):
                     break
         except Exception as e:
-            log(f"오류: {e!r}")
+            log(f"worker error: {e!r}")
             if state.stop.wait(CHECK_INTERVAL_SEC):
                 break
-    log(f"{APP_NAME} 워커 종료")
+    log(f"{APP_NAME} worker stopped")
 
 
 def load_icon_image() -> Image.Image:
@@ -116,7 +119,7 @@ def load_icon_image() -> Image.Image:
             try:
                 return Image.open(path)
             except Exception as e:
-                log(f"아이콘 로드 실패 ({name}): {e!r}")
+                log(f"icon load failed ({name}): {e!r}")
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse((4, 4, 60, 60), fill=(30, 144, 255, 255), outline=(255, 255, 255, 255), width=2)
@@ -127,20 +130,20 @@ def load_icon_image() -> Image.Image:
 def build_menu(state: State, on_exit) -> pystray.Menu:
     def status_text(_item):
         if state.last_nudge is None:
-            return f"실행 중 (이동 0회) - 시작 {state.started_at:%H:%M:%S}"
+            return f"Running (count: 0) - started {state.started_at:%H:%M:%S}"
         return (
-            f"실행 중 - 마지막 이동 {state.last_nudge:%H:%M:%S} "
-            f"(누적 {state.nudge_count}회)"
+            f"Running - last move {state.last_nudge:%H:%M:%S} "
+            f"(count: {state.nudge_count})"
         )
 
     def threshold_text(_item):
-        return f"유휴 임계값: {IDLE_THRESHOLD_SEC // 60}분 / 이동: {NUDGE_PIXELS}px"
+        return f"Idle threshold: {IDLE_THRESHOLD_SEC // 60} min / Move: {NUDGE_PIXELS}px"
 
     return pystray.Menu(
-        pystray.MenuItem(status_text, None, enabled=False, default=True),
+        pystray.MenuItem(status_text, None, enabled=False),
         pystray.MenuItem(threshold_text, None, enabled=False),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("종료", on_exit),
+        pystray.MenuItem("Exit", on_exit),
     )
 
 
@@ -149,7 +152,7 @@ def main() -> int:
     icon_image = load_icon_image()
 
     def on_exit(icon, _item):
-        log("사용자 종료 요청")
+        log("user requested exit")
         state.stop.set()
         icon.stop()
 
@@ -160,15 +163,15 @@ def main() -> int:
         build_menu(state, on_exit),
     )
 
-    t = threading.Thread(target=worker, args=(state,), daemon=True)
+    t = threading.Thread(target=worker, args=(state, icon), daemon=True)
     t.start()
 
-    log(f"{APP_NAME} 시작됨")
+    log(f"{APP_NAME} started")
     icon.run()
 
     state.stop.set()
     t.join(timeout=2)
-    log(f"{APP_NAME} 종료됨")
+    log(f"{APP_NAME} stopped")
     return 0
 
 
