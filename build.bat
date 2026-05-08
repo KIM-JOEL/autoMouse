@@ -1,8 +1,9 @@
 @echo off
 REM ================================================================
-REM  MouseMover build script (ASCII-only, works on any Windows)
-REM  - Logs each step to build.log AND to the console
-REM  - Window stays open after success or failure (pause at end)
+REM  MouseMover build script (size-optimized, no Pillow/pystray)
+REM  - Pure ctypes Win32 tray, no third-party runtime deps
+REM  - Auto-downloads UPX if missing (for ~50%% size reduction)
+REM  - Single .exe output around 4-6 MB
 REM ================================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
@@ -11,11 +12,10 @@ set "LOGFILE=build.log"
 > "%LOGFILE%" echo === MouseMover build log ===
 >> "%LOGFILE%" echo DATE=%DATE% TIME=%TIME%
 >> "%LOGFILE%" echo CWD=%CD%
->> "%LOGFILE%" echo USER=%USERNAME%
 
 echo.
 echo ================================================================
-echo  MouseMover build starting...
+echo  MouseMover build (size-optimized)
 echo  Log file: %CD%\%LOGFILE%
 echo ================================================================
 
@@ -29,78 +29,91 @@ if errorlevel 1 (
     echo  On the installer screen, CHECK the box: 'Add Python to PATH'
     goto :end
 )
-python --version 1>>"%LOGFILE%" 2>&1
-if errorlevel 1 (
-    call :fail "python --version failed. Python installation may be corrupted."
-    goto :end
-)
 for /f "tokens=*" %%v in ('python --version 2^>^&1') do echo   Found: %%v
 
 REM -------------------------------------------------------------- [2]
-call :step "[2/6] Upgrading pip"
+call :step "[2/6] Installing PyInstaller"
 python -m pip install --upgrade pip 1>>"%LOGFILE%" 2>&1
+python -m pip install --upgrade pyinstaller 1>>"%LOGFILE%" 2>&1
 if errorlevel 1 (
-    call :fail "pip upgrade failed. Possible cause: corporate proxy/firewall. Check build.log."
+    call :fail "PyInstaller install failed. Check build.log."
     goto :end
 )
 
 REM -------------------------------------------------------------- [3]
-call :step "[3/6] Installing dependencies (pyinstaller, pystray, Pillow)"
-python -m pip install --upgrade pyinstaller pystray Pillow 1>>"%LOGFILE%" 2>&1
-if errorlevel 1 (
-    call :fail "Dependency install failed. Check build.log for pip error details."
-    goto :end
+call :step "[3/6] Preparing UPX (size compression)"
+set "UPX_OPT=--noupx"
+set "UPX_DIR_OPT="
+where upx 1>nul 2>&1
+if not errorlevel 1 (
+    echo   UPX found in PATH
+    set "UPX_OPT="
+    goto :upx_ready
 )
+if exist "upx\upx.exe" (
+    echo   UPX found in local upx\ folder
+    set "UPX_OPT="
+    set "UPX_DIR_OPT=--upx-dir=upx"
+    goto :upx_ready
+)
+echo   UPX not found - attempting auto-download from GitHub...
+powershell -NoProfile -Command "try { $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri 'https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip' -OutFile 'upx.zip' -ErrorAction Stop; Expand-Archive -Path 'upx.zip' -DestinationPath '.' -Force; Move-Item -Force 'upx-4.2.4-win64' 'upx'; Remove-Item 'upx.zip'; exit 0 } catch { exit 1 }" 1>>"%LOGFILE%" 2>&1
+if exist "upx\upx.exe" (
+    echo   UPX downloaded successfully
+    set "UPX_OPT="
+    set "UPX_DIR_OPT=--upx-dir=upx"
+) else (
+    echo   UPX download failed - building without UPX (size will be ~7-8 MB instead of ~4-5 MB)
+    echo   To enable UPX manually: download from https://upx.github.io/ and place upx.exe in PATH
+)
+:upx_ready
 
 REM -------------------------------------------------------------- [4]
 call :step "[4/6] Preparing icon"
-if exist icon.ico (
-    echo   Using existing icon.ico
-    >> "%LOGFILE%" echo icon.ico found - using as is
-) else (
-    if exist icon.png (
-        echo   icon.png found - auto-converting to icon.ico
-        python -c "from PIL import Image; im=Image.open('icon.png').convert('RGBA'); im.save('icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])" 1>>"%LOGFILE%" 2>&1
-        if errorlevel 1 (
-            call :fail "Failed to convert icon.png to icon.ico. Check build.log."
-            goto :end
-        )
-    ) else (
-        echo   No icon.ico/icon.png found - will use built-in fallback icon
-        >> "%LOGFILE%" echo no icon files - using fallback
-    )
+if not exist icon.ico (
+    call :fail "icon.ico not found. Cannot embed app icon."
+    goto :end
 )
+echo   Using icon.ico
 
 REM -------------------------------------------------------------- [5]
 call :step "[5/6] Cleaning previous build artifacts"
-if exist build (
-    rmdir /s /q build 1>>"%LOGFILE%" 2>&1
-    if errorlevel 1 (
-        call :fail "Cannot delete 'build' folder. Another process may be using it."
-        goto :end
-    )
-)
-if exist dist (
-    rmdir /s /q dist 1>>"%LOGFILE%" 2>&1
-    if errorlevel 1 (
-        call :fail "Cannot delete 'dist' folder. If MouseMover.exe is running, stop it first."
-        goto :end
-    )
+if exist build rmdir /s /q build 1>>"%LOGFILE%" 2>&1
+if exist dist rmdir /s /q dist 1>>"%LOGFILE%" 2>&1
+if errorlevel 1 (
+    call :fail "Cannot delete dist folder. If MouseMover.exe is running, exit it first."
+    goto :end
 )
 if exist MouseMover.spec del /q MouseMover.spec
 
 REM -------------------------------------------------------------- [6]
 call :step "[6/6] Building .exe with PyInstaller"
-set "ICON_OPT="
-set "DATA_OPT="
-if exist icon.ico (
-    set "ICON_OPT=--icon=icon.ico"
-    set "DATA_OPT=--add-data icon.ico;."
-)
-echo   Running: python -m PyInstaller --onefile --noconsole --name MouseMover !ICON_OPT! !DATA_OPT! automouse.py
->> "%LOGFILE%" echo CMD: python -m PyInstaller --onefile --noconsole --name MouseMover !ICON_OPT! !DATA_OPT! automouse.py
+echo   Running PyInstaller (this takes ~30 seconds)...
+python -m PyInstaller ^
+    --onefile ^
+    --noconsole ^
+    --name MouseMover ^
+    --icon=icon.ico ^
+    --strip ^
+    !UPX_OPT! ^
+    !UPX_DIR_OPT! ^
+    --exclude-module tkinter ^
+    --exclude-module unittest ^
+    --exclude-module test ^
+    --exclude-module pydoc ^
+    --exclude-module doctest ^
+    --exclude-module xml ^
+    --exclude-module xmlrpc ^
+    --exclude-module email ^
+    --exclude-module html ^
+    --exclude-module http ^
+    --exclude-module urllib ^
+    --exclude-module pdb ^
+    --exclude-module pkg_resources ^
+    --exclude-module setuptools ^
+    --exclude-module distutils ^
+    automouse.py 1>>"%LOGFILE%" 2>&1
 
-python -m PyInstaller --onefile --noconsole --name MouseMover !ICON_OPT! !DATA_OPT! automouse.py 1>>"%LOGFILE%" 2>&1
 if errorlevel 1 (
     call :fail "PyInstaller build failed. Check the last 50 lines of build.log."
     goto :end
@@ -114,15 +127,18 @@ REM ----------------------------------------------------------- SUCCESS
 echo.
 echo ================================================================
 echo  [SUCCESS] Build complete!
-for %%I in (dist\MouseMover.exe) do echo   Output: %%~fI  (%%~zI bytes)
-echo   Log:    %CD%\%LOGFILE%
+for %%I in (dist\MouseMover.exe) do (
+    set /a SIZE_MB=%%~zI / 1048576
+    set /a SIZE_KB=%%~zI / 1024
+    echo   Output: %%~fI
+    echo   Size:   !SIZE_MB! MB ^(!SIZE_KB! KB / %%~zI bytes^)
+)
 echo.
 echo  HOW TO RUN: Double-click dist\MouseMover.exe
 echo   - App icon appears in system tray (taskbar right side, hidden icons)
 echo   - Hover over icon: shows "MouseMover" tooltip
 echo   - Right-click: shows status + settings + Exit menu
 echo ================================================================
->> "%LOGFILE%" echo === BUILD SUCCESS ===
 goto :end
 
 
