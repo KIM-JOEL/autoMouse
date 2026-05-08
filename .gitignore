@@ -5,3 +5,5 @@ dist/
 *.spec
 automouse.log
 build.log
+upx/
+upx.zip

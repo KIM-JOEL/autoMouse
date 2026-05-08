@@ -3,175 +3,254 @@ import os
 import sys
 import threading
 import time
-from ctypes import wintypes
+from ctypes import (
+    POINTER, Structure, WINFUNCTYPE, byref, c_int, c_void_p, sizeof, wintypes,
+)
 from datetime import datetime
-
-import pystray
-from PIL import Image, ImageDraw
 
 APP_NAME = "MouseMover"
 IDLE_THRESHOLD_SEC = 4 * 60
 NUDGE_PIXELS = 5
 CHECK_INTERVAL_SEC = 15
 
+WM_DESTROY = 0x0002
+WM_COMMAND = 0x0111
+WM_LBUTTONUP = 0x0202
+WM_RBUTTONUP = 0x0205
+WM_USER = 0x0400
+WM_TRAYICON = WM_USER + 1
+
+NIM_ADD = 0x0
+NIM_DELETE = 0x2
+NIF_MESSAGE = 0x1
+NIF_ICON = 0x2
+NIF_TIP = 0x4
+
+MF_STRING = 0x0
+MF_SEPARATOR = 0x800
+MFS_DISABLED = 0x3
+TPM_RIGHTBUTTON = 0x0002
+
+IMAGE_ICON = 1
+LR_LOADFROMFILE = 0x10
+
 MOUSEEVENTF_MOVE = 0x0001
 
-
-def _base_dir() -> str:
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-def _resource_path(rel: str) -> str:
-    base = getattr(sys, "_MEIPASS", _base_dir())
-    return os.path.join(base, rel)
-
-
-LOG_FILE = os.path.join(_base_dir(), "automouse.log")
-
-
-class LASTINPUTINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
-
-
-class POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
+IDM_STATUS = 1001
+IDM_THRESHOLD = 1002
+IDM_EXIT = 1003
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
+shell32 = ctypes.windll.shell32
 
 
-def log(msg: str) -> None:
-    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except OSError:
-        pass
+class POINT(Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
 
 
-def get_idle_seconds() -> float:
+class LASTINPUTINFO(Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+
+WNDPROC = WINFUNCTYPE(c_int, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+
+class WNDCLASSEXW(Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", WNDPROC),
+        ("cbClsExtra", c_int),
+        ("cbWndExtra", c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HANDLE),
+        ("hbrBackground", wintypes.HBRUSH),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+        ("hIconSm", wintypes.HICON),
+    ]
+
+
+class NOTIFYICONDATAW(Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT),
+        ("uFlags", wintypes.UINT),
+        ("uCallbackMessage", wintypes.UINT),
+        ("hIcon", wintypes.HICON),
+        ("szTip", wintypes.WCHAR * 128),
+        ("dwState", wintypes.DWORD),
+        ("dwStateMask", wintypes.DWORD),
+        ("szInfo", wintypes.WCHAR * 256),
+        ("uVersion", wintypes.UINT),
+        ("szInfoTitle", wintypes.WCHAR * 64),
+        ("dwInfoFlags", wintypes.DWORD),
+    ]
+
+
+class MSG(Structure):
+    _fields_ = [
+        ("hWnd", wintypes.HWND),
+        ("message", wintypes.UINT),
+        ("wParam", wintypes.WPARAM),
+        ("lParam", wintypes.LPARAM),
+        ("time", wintypes.DWORD),
+        ("pt", POINT),
+    ]
+
+
+# 64-bit 안전성을 위해 핸들 반환 함수에 restype 명시
+user32.CreateWindowExW.restype = wintypes.HWND
+user32.DefWindowProcW.restype = wintypes.LPARAM
+user32.LoadImageW.restype = wintypes.HANDLE
+user32.LoadIconW.restype = wintypes.HICON
+user32.CreatePopupMenu.restype = wintypes.HMENU
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+shell32.ExtractIconExW.restype = wintypes.UINT
+
+
+class State:
+    def __init__(self):
+        self.stop = threading.Event()
+        self.nudge_count = 0
+        self.last_nudge = None
+        self.started_at = datetime.now()
+        self.nid = None
+
+
+state = State()
+
+
+def get_idle_seconds():
     lii = LASTINPUTINFO()
-    lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
-    if not user32.GetLastInputInfo(ctypes.byref(lii)):
+    lii.cbSize = sizeof(LASTINPUTINFO)
+    if not user32.GetLastInputInfo(byref(lii)):
         return 0.0
     return (kernel32.GetTickCount() - lii.dwTime) / 1000.0
 
 
-def nudge_mouse() -> None:
-    # SetCursorPos 는 커서 좌표만 텔레포트하고 입력 이벤트를 큐에 넣지 않아
-    # GetLastInputInfo / 화면보호기 타이머가 리셋되지 않음.
-    # mouse_event 는 실제 입력 이벤트를 주입하므로 OS 가 "사용자 입력" 으로 인식.
+def nudge_mouse():
     user32.mouse_event(MOUSEEVENTF_MOVE, NUDGE_PIXELS, 0, 0, 0)
     time.sleep(0.05)
     user32.mouse_event(MOUSEEVENTF_MOVE, -NUDGE_PIXELS, 0, 0, 0)
 
 
-class State:
-    def __init__(self) -> None:
-        self.stop = threading.Event()
-        self.nudge_count = 0
-        self.last_nudge: datetime | None = None
-        self.started_at = datetime.now()
-
-
-def worker(state: State, icon) -> None:
-    log(
-        f"{APP_NAME} worker started - threshold {IDLE_THRESHOLD_SEC // 60}min, "
-        f"nudge {NUDGE_PIXELS}px, interval {CHECK_INTERVAL_SEC}s"
-    )
+def worker():
     while not state.stop.is_set():
         try:
             idle = get_idle_seconds()
             if idle >= IDLE_THRESHOLD_SEC:
                 nudge_mouse()
-                # 입력 주입이 정상이면 0초 근처가 찍힘 (검증용)
-                post_idle = get_idle_seconds()
                 state.nudge_count += 1
                 state.last_nudge = datetime.now()
-                log(
-                    f"idle={int(idle)}s -> nudge "
-                    f"(count={state.nudge_count}, post_idle={post_idle:.2f}s)"
-                )
-                try:
-                    icon.update_menu()
-                except Exception as e:
-                    log(f"update_menu failed: {e!r}")
                 if state.stop.wait(CHECK_INTERVAL_SEC):
                     break
             else:
                 remaining = IDLE_THRESHOLD_SEC - idle
                 if state.stop.wait(min(CHECK_INTERVAL_SEC, max(1.0, remaining))):
                     break
-        except Exception as e:
-            log(f"worker error: {e!r}")
+        except Exception:
             if state.stop.wait(CHECK_INTERVAL_SEC):
                 break
-    log(f"{APP_NAME} worker stopped")
 
 
-def load_icon_image() -> Image.Image:
-    for name in ("icon.ico", "icon.png"):
-        path = _resource_path(name)
-        if os.path.exists(path):
-            try:
-                return Image.open(path)
-            except Exception as e:
-                log(f"icon load failed ({name}): {e!r}")
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.ellipse((4, 4, 60, 60), fill=(30, 144, 255, 255), outline=(255, 255, 255, 255), width=2)
-    draw.ellipse((26, 26, 38, 38), fill=(255, 255, 255, 255))
-    return img
+def load_app_icon():
+    if getattr(sys, "frozen", False):
+        large = wintypes.HICON()
+        small = wintypes.HICON()
+        shell32.ExtractIconExW(sys.executable, 0, byref(large), byref(small), 1)
+        return small.value or large.value or 0
+    here = os.path.dirname(os.path.abspath(__file__))
+    ico = os.path.join(here, "icon.ico")
+    if os.path.exists(ico):
+        return user32.LoadImageW(None, ico, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+    return user32.LoadIconW(None, ctypes.c_wchar_p(32512))  # IDI_APPLICATION
 
 
-def build_menu(state: State, on_exit) -> pystray.Menu:
-    def status_text(_item):
-        if state.last_nudge is None:
-            return f"Running (count: 0) - started {state.started_at:%H:%M:%S}"
-        return (
+def show_context_menu(hwnd):
+    h_menu = user32.CreatePopupMenu()
+    if state.last_nudge is None:
+        status = f"Running (count: 0) - started {state.started_at:%H:%M:%S}"
+    else:
+        status = (
             f"Running - last move {state.last_nudge:%H:%M:%S} "
             f"(count: {state.nudge_count})"
         )
+    threshold = f"Idle threshold: {IDLE_THRESHOLD_SEC // 60} min / Move: {NUDGE_PIXELS}px"
+    user32.AppendMenuW(h_menu, MF_STRING | MFS_DISABLED, IDM_STATUS, status)
+    user32.AppendMenuW(h_menu, MF_STRING | MFS_DISABLED, IDM_THRESHOLD, threshold)
+    user32.AppendMenuW(h_menu, MF_SEPARATOR, 0, None)
+    user32.AppendMenuW(h_menu, MF_STRING, IDM_EXIT, "Exit")
 
-    def threshold_text(_item):
-        return f"Idle threshold: {IDLE_THRESHOLD_SEC // 60} min / Move: {NUDGE_PIXELS}px"
+    pt = POINT()
+    user32.GetCursorPos(byref(pt))
+    user32.SetForegroundWindow(hwnd)
+    user32.TrackPopupMenu(h_menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None)
+    user32.DestroyMenu(h_menu)
 
-    return pystray.Menu(
-        pystray.MenuItem(status_text, None, enabled=False),
-        pystray.MenuItem(threshold_text, None, enabled=False),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Exit", on_exit),
+
+def wnd_proc(hwnd, msg, wparam, lparam):
+    if msg == WM_TRAYICON:
+        if lparam in (WM_RBUTTONUP, WM_LBUTTONUP):
+            show_context_menu(hwnd)
+            return 0
+    elif msg == WM_COMMAND:
+        if (wparam & 0xFFFF) == IDM_EXIT:
+            user32.DestroyWindow(hwnd)
+            return 0
+    elif msg == WM_DESTROY:
+        if state.nid is not None:
+            shell32.Shell_NotifyIconW(NIM_DELETE, byref(state.nid))
+        user32.PostQuitMessage(0)
+        return 0
+    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+WND_PROC_INSTANCE = WNDPROC(wnd_proc)
+
+
+def main():
+    h_inst = kernel32.GetModuleHandleW(None)
+
+    wc = WNDCLASSEXW()
+    wc.cbSize = sizeof(WNDCLASSEXW)
+    wc.lpfnWndProc = WND_PROC_INSTANCE
+    wc.hInstance = h_inst
+    wc.lpszClassName = "MouseMoverWindowClass"
+    if not user32.RegisterClassExW(byref(wc)):
+        return 1
+
+    hwnd = user32.CreateWindowExW(
+        0, "MouseMoverWindowClass", APP_NAME, 0,
+        0, 0, 0, 0, None, None, h_inst, None,
     )
+    if not hwnd:
+        return 1
 
+    h_icon = load_app_icon()
 
-def main() -> int:
-    state = State()
-    icon_image = load_icon_image()
+    nid = NOTIFYICONDATAW()
+    nid.cbSize = sizeof(NOTIFYICONDATAW)
+    nid.hWnd = hwnd
+    nid.uID = 1
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+    nid.uCallbackMessage = WM_TRAYICON
+    nid.hIcon = h_icon
+    nid.szTip = APP_NAME
+    shell32.Shell_NotifyIconW(NIM_ADD, byref(nid))
+    state.nid = nid
 
-    def on_exit(icon, _item):
-        log("user requested exit")
-        state.stop.set()
-        icon.stop()
+    threading.Thread(target=worker, daemon=True).start()
 
-    icon = pystray.Icon(
-        APP_NAME,
-        icon_image,
-        APP_NAME,
-        build_menu(state, on_exit),
-    )
-
-    t = threading.Thread(target=worker, args=(state, icon), daemon=True)
-    t.start()
-
-    log(f"{APP_NAME} started")
-    icon.run()
+    msg = MSG()
+    while user32.GetMessageW(byref(msg), None, 0, 0) > 0:
+        user32.TranslateMessage(byref(msg))
+        user32.DispatchMessageW(byref(msg))
 
     state.stop.set()
-    t.join(timeout=2)
-    log(f"{APP_NAME} stopped")
     return 0
 
 

@@ -16,6 +16,7 @@
   - 실행 상태 (마지막 이동 시각 / 누적 횟수)
   - 설정 표시 (임계값 / 이동 픽셀)
   - Exit
+- 외부 의존성 없음 — pure ctypes Win32 구현으로 .exe 약 4~6MB
 
 ---
 
@@ -63,32 +64,18 @@ build.bat  (더블클릭)
 ```
 
 단계별 진행 상황이 표시되며 실패 시 원인과 힌트가 출력됩니다.  
-상세 로그는 같은 폴더의 `build.log`에 기록됩니다.
+상세 로그는 같은 폴더의 `build.log`에 기록됩니다.  
+`upx.exe`가 PATH에 없으면 빌드 스크립트가 자동으로 GitHub에서 다운로드합니다.
 
-산출물: `dist\MouseMover.exe` (단일 파일, 약 15MB)
-
----
-
-## 로그
-
-실행 파일과 같은 폴더에 `automouse.log`가 생성됩니다.
-
-```
-[2026-05-08 09:00:00] MouseMover started
-[2026-05-08 09:00:00] MouseMover worker started - threshold 4min, nudge 5px, interval 15s
-[2026-05-08 09:04:01] idle=240s -> nudge (count=1, post_idle=0.00s)
-[2026-05-08 09:08:02] idle=240s -> nudge (count=2, post_idle=0.00s)
-```
-
-`post_idle=0.00s` — 마우스 이동 직후 유휴 시간이 0으로 리셋된 것을 의미합니다.
+산출물: `dist\MouseMover.exe` (단일 파일, UPX 압축 시 약 4~5MB / 미압축 시 약 7~8MB)
 
 ---
 
 ## 파일 구성
 
 ```
-automouse.py   # 메인 소스 (설정 상수 포함)
-build.bat      # Windows 빌드 스크립트 (PyInstaller)
+automouse.py   # 메인 소스 (ctypes Win32 트레이 + 마우스 이동)
+build.bat      # Windows 빌드 스크립트 (PyInstaller + UPX)
 icon.ico       # 앱 아이콘 (멀티해상도 16~256px)
 icon.png       # 아이콘 소스 (투명 배경 크롭본)
 ```
